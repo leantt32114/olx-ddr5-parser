@@ -42,10 +42,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 # ---------------------------------------------------------------------------
 
 SEARCH_URL = (
-    "https://www.olx.kz/elektronika/kompyutery-i-komplektuyuschie/"
-    "komplektuyuschie-i-aksesuary/alma-ata/q-DDR5-32GB/"
-    "?search%5Border%5D=created_at:desc"
-    "&search%5Bfilter_enum_subcategory%5D%5B0%5D=moduli-pamyati"
+    https://www.olx.kz/elektronika/kompyutery-i-komplektuyuschie/komplektuyuschie-i-aksesuary/alma-ata/q-DDR5-32GB/?search%5Border%5D=filter_float_price:desc&search%5Bfilter_float_price:from%5D=100000&search%5Bfilter_float_price:to%5D=200000
 )
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
