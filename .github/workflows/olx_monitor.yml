@@ -1,0 +1,56 @@
+name: OLX Monitor
+
+on:
+  schedule:
+    # Запуск каждые 5 минут.
+    # ВАЖНО: GitHub Actions не гарантирует точность cron-расписания —
+    # в моменты высокой нагрузки на инфраструктуру GitHub запуск может
+    # задержаться на несколько минут. Для мониторинга объявлений это
+    # не критично.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}  # позволяет запустить проверку вручную из вкладки Actions
+
+permissions:
+  contents: write  # нужно, чтобы workflow мог закоммитить обновлённый seen_ads.json
+
+concurrency:
+  group: olx-monitor
+  cancel-in-progress: false  # не отменяем предыдущий запуск, а ждём его завершения
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8  # страховка на случай, если Playwright/страница зависнет
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install --with-deps chromium
+
+      - name: Run OLX monitor
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python olx_monitor.py
+
+      - name: Commit updated seen_ads.json (if changed)
+        run: |
+          if [ -z "$(git status --porcelain seen_ads.json)" ]; then
+            echo "seen_ads.json не изменился, коммит не нужен"
+          else
+            git config user.name "olx-monitor-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add seen_ads.json
+            git commit -m "chore: update seen_ads.json [skip ci]"
+            git push
+          fi
