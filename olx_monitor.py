@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
 """
-Мониторинг объявлений OLX.kz (DDR5 32GB, Алматы) с отправкой новых
-объявлений в Telegram через бота.
+Мониторинг объявлений OLX.kz (DDR5 32GB, Алматы) через headless-браузер
+Playwright, с отправкой новых объявлений в Telegram.
 
-Установка зависимостей:
-    pip install requests beautifulsoup4
+Почему Playwright, а не requests/BeautifulSoup:
+    OLX защищён Cloudflare, и частые запросы "голым" HTTP-клиентом с
+    IP облачного сервера (Render) быстро получают 403. Настоящий
+    headless-браузер проходит проверку Cloudflare гораздо надёжнее.
+
+Экономия памяти на бесплатном тарифе Render (512 МБ):
+    - Браузер и контекст открываются заново на каждую проверку и
+      полностью закрываются (browser.close()) сразу после неё —
+      между проверками в памяти не остаётся ни одного процесса Chromium.
+    - Используется только Chromium (не ставим Firefox/WebKit).
+    - Закрытие идёт через try/finally, поэтому происходит даже при ошибке.
+
+Установка (локально):
+    pip install -r requirements.txt
+    playwright install --with-deps chromium
 
 Настройка:
-    1. Создайте бота через @BotFather в Telegram, получите TELEGRAM_TOKEN.
-    2. Узнайте свой chat_id (например, написав боту @userinfobot,
-       либо отправив /start своему боту и открыв
-       https://api.telegram.org/bot<TOKEN>/getUpdates ).
-    3. Впишите значения в переменные ниже (или задайте через переменные
-       окружения TELEGRAM_TOKEN / TELEGRAM_CHAT_ID).
-    4. Запустите: python olx_monitor.py
-       Скрипт будет проверять объявления каждые CHECK_INTERVAL секунд.
+    Переменные окружения TELEGRAM_TOKEN и TELEGRAM_CHAT_ID
+    (на Render задаются в разделе Environment).
 
-Как это работает:
-    - При каждой проверке скрипт скачивает страницу поиска OLX.
-    - Извлекает карточки объявлений (ссылка, заголовок, цена).
-    - ID объявления (последнее число в URL) сравнивается со списком
-      уже отправленных ID, которые хранятся в файле seen_ads.json.
-    - Новые объявления отправляются в Telegram и добавляются в файл.
+Запуск:
+    python olx_monitor.py
 """
 
 import os
@@ -32,7 +35,7 @@ import logging
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 # ---------------------------------------------------------------------------
 # НАСТРОЙКИ
@@ -45,19 +48,16 @@ SEARCH_URL = (
     "&search%5Bfilter_enum_subcategory%5D%5B0%5D=moduli-pamyati"
 )
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "ВАШ_ТОКЕН_БОТА")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "ВАШ_CHAT_ID")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-CHECK_INTERVAL = 300  # секунды между проверками (5 минут)
+CHECK_INTERVAL = 300  # 5 минут
 STATE_FILE = Path(__file__).parent / "seen_ads.json"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ru-RU,ru;q=0.9",
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,56 +86,81 @@ def save_seen_ids(seen_ids: set) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# ПАРСИНГ OLX
-# ---------------------------------------------------------------------------
-
 def extract_ad_id(url: str) -> str:
-    """Достаём уникальный ID объявления из ссылки (число перед .html)."""
     match = re.search(r"-ID(\w+)\.html", url)
-    if match:
-        return match.group(1)
-    # запасной вариант — вся ссылка как ID
-    return url
+    return match.group(1) if match else url
 
+
+# ---------------------------------------------------------------------------
+# PLAYWRIGHT: ПОЛУЧЕНИЕ ОБЪЯВЛЕНИЙ
+# ---------------------------------------------------------------------------
 
 def fetch_ads() -> list[dict]:
-    resp = requests.get(SEARCH_URL, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    """
+    Открывает браузер, загружает страницу поиска, извлекает объявления
+    и полностью закрывает браузер перед выходом из функции — независимо
+    от того, произошла ошибка или нет.
+    """
+    ads: list[dict] = []
 
-    ads = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-extensions",
+                "--disable-background-networking",
+            ],
+        )
+        try:
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                locale="ru-RU",
+                viewport={"width": 1280, "height": 800},
+            )
+            try:
+                page = context.new_page()
+                page.set_default_timeout(30000)
 
-    # OLX обычно рендерит карточки объявлений в контейнерах с атрибутом
-    # data-cy="l-card". Это может со временем поменяться — тогда нужно
-    # будет обновить селекторы ниже, посмотрев актуальную верстку страницы.
-    cards = soup.select('[data-cy="l-card"]')
+                page.goto(SEARCH_URL, wait_until="domcontentloaded")
 
-    for card in cards:
-        link_tag = card.select_one("a[href]")
-        if not link_tag:
-            continue
+                try:
+                    page.wait_for_selector('[data-cy="l-card"]', timeout=20000)
+                except PWTimeoutError:
+                    log.warning("Карточки объявлений не появились за 20с — "
+                                "возможно, изменилась вёрстка или сработала защита")
 
-        href = link_tag["href"]
-        if href.startswith("/"):
-            href = "https://www.olx.kz" + href
-        if "olx.kz" not in href:
-            continue  # пропускаем внешние/рекламные блоки
+                cards = page.query_selector_all('[data-cy="l-card"]')
+                log.info("Найдено карточек на странице: %d", len(cards))
 
-        title_tag = card.select_one("h4, h6")
-        title = title_tag.get_text(strip=True) if title_tag else "Без названия"
+                for card in cards:
+                    link_el = card.query_selector("a[href]")
+                    if not link_el:
+                        continue
+                    href = link_el.get_attribute("href") or ""
+                    if href.startswith("/"):
+                        href = "https://www.olx.kz" + href
+                    if "olx.kz" not in href:
+                        continue
 
-        price_tag = card.select_one('[data-testid="ad-price"]')
-        price = price_tag.get_text(strip=True) if price_tag else "Цена не указана"
+                    title_el = card.query_selector("h4, h6")
+                    title = title_el.inner_text().strip() if title_el else "Без названия"
 
-        ad_id = extract_ad_id(href)
+                    price_el = card.query_selector('[data-testid="ad-price"]')
+                    price = price_el.inner_text().strip() if price_el else "Цена не указана"
 
-        ads.append({
-            "id": ad_id,
-            "title": title,
-            "price": price,
-            "url": href,
-        })
+                    ads.append({
+                        "id": extract_ad_id(href),
+                        "title": title,
+                        "price": price,
+                        "url": href,
+                    })
+            finally:
+                context.close()
+        finally:
+            browser.close()
 
     return ads
 
@@ -145,6 +170,9 @@ def fetch_ads() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def send_telegram_message(text: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID не заданы — сообщение не отправлено")
+        return
     api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -160,11 +188,7 @@ def send_telegram_message(text: str) -> None:
 
 
 def format_ad_message(ad: dict) -> str:
-    return (
-        f"🆕 <b>{ad['title']}</b>\n"
-        f"💰 {ad['price']}\n"
-        f"🔗 {ad['url']}"
-    )
+    return f"🆕 <b>{ad['title']}</b>\n💰 {ad['price']}\n🔗 {ad['url']}"
 
 
 # ---------------------------------------------------------------------------
@@ -174,43 +198,45 @@ def format_ad_message(ad: dict) -> str:
 def check_once(seen_ids: set) -> set:
     try:
         ads = fetch_ads()
-    except requests.RequestException as e:
+    except Exception as e:  # ловим и ошибки Playwright (таймауты, краши браузера)
         log.error("Не удалось загрузить страницу OLX: %s", e)
         return seen_ids
 
-    log.info("Найдено объявлений на странице: %d", len(ads))
+    if not ads:
+        log.warning("Объявления не найдены — пропускаю эту проверку")
+        return seen_ids
+
+    if not seen_ids:
+        log.info("Первый запуск — сохраняю текущие объявления без отправки (%d шт.)", len(ads))
+        return {ad["id"] for ad in ads}
 
     new_ads = [ad for ad in ads if ad["id"] not in seen_ids]
 
-    if not seen_ids:
-        # Первый запуск: просто запоминаем всё, что есть сейчас,
-        # чтобы не заспамить чат старыми объявлениями.
-        log.info("Первый запуск — сохраняю текущие объявления без отправки")
-        return {ad["id"] for ad in ads}
-
-    for ad in reversed(new_ads):  # отправляем от старых к новым
+    for ad in reversed(new_ads):  # от старых к новым
         log.info("Новое объявление: %s", ad["title"])
         send_telegram_message(format_ad_message(ad))
         seen_ids.add(ad["id"])
-        time.sleep(1)  # не спамить Telegram API
+        time.sleep(1)
 
     return seen_ids | {ad["id"] for ad in ads}
 
 
 def main():
-    if TELEGRAM_TOKEN == "ВАШ_ТОКЕН_БОТА" or TELEGRAM_CHAT_ID == "ВАШ_CHAT_ID":
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning(
-            "Заполните TELEGRAM_TOKEN и TELEGRAM_CHAT_ID в коде "
-            "или через переменные окружения перед запуском!"
+            "TELEGRAM_TOKEN / TELEGRAM_CHAT_ID не заданы через переменные окружения!"
         )
 
     seen_ids = load_seen_ids()
     log.info("Загружено ранее увиденных объявлений: %d", len(seen_ids))
 
     while True:
+        start = time.time()
         seen_ids = check_once(seen_ids)
         save_seen_ids(seen_ids)
-        log.info("Ожидание %d секунд до следующей проверки...", CHECK_INTERVAL)
+        elapsed = time.time() - start
+        log.info("Проверка заняла %.1fс. Ожидание %d секунд до следующей...",
+                  elapsed, CHECK_INTERVAL)
         time.sleep(CHECK_INTERVAL)
 
 
